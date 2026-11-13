@@ -31,13 +31,28 @@
         }
 
         .black-hole-container {
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100vh;
-            z-index: -1;
+            position: absolute;
+            inset: 0;                /* matches the hero section exactly */
+            overflow: hidden;        /* canvas can never spill outside the hero */
+            contain: strict;
+            z-index: 0;
             pointer-events: none;
+        }
+        .black-hole-container canvas { display: block; width: 100%; height: 100%; }
+        /* soft fade from the hero into the next section */
+        .hero-fade-bottom {
+            position: absolute;
+            left: 0; right: 0; bottom: -1px;
+            height: clamp(160px, 32vh, 340px);
+            z-index: 0;
+            pointer-events: none;
+            background: linear-gradient(to bottom,
+                rgba(0,0,0,0) 0%,
+                rgba(0,0,0,0.08) 20%,
+                rgba(0,0,0,0.28) 40%,
+                rgba(0,0,0,0.58) 62%,
+                rgba(0,0,0,0.86) 82%,
+                #000 100%);
         }
 
         .glass-card {
@@ -127,9 +142,6 @@
 </head>
 <body>
     <div class="relative min-h-screen text-white selection:bg-white selection:text-black" data-sd-id="1">
-        <!-- Background Layer -->
-        <div id="black-hole-canvas" class="black-hole-container" data-sd-id="2"></div>
-
         <!-- Header Navigation -->
         <header class="fixed top-0 left-0 w-full z-50 px-6 py-8 md:px-12 flex justify-between items-center transition-all duration-300" id="main-header" data-sd-id="3">
             <div class="flex items-center gap-3 group" data-sd-id="4">
@@ -154,6 +166,9 @@
 
         <!-- Hero Section -->
         <section id="home" class="relative h-screen flex flex-col items-center justify-center text-center px-6 overflow-hidden" data-sd-id="16">
+            <!-- Hero canvas: clipped to this section, paused when off-screen -->
+            <div id="black-hole-canvas" class="black-hole-container" aria-hidden="true" data-sd-id="2"></div>
+            <div class="hero-fade-bottom" aria-hidden="true"></div>
             <div class="max-w-4xl z-10 hero-content opacity-0" data-sd-id="17">
                 <p class="font-heading tracking-[0.4em] text-xs md:text-sm text-silver/60 mb-6 uppercase" data-sd-id="18">Hello, World. I'm</p>
                 <h1 class="font-heading text-5xl md:text-8xl font-bold tracking-tighter mb-6 hero-glow leading-none" data-sd-id="19">
@@ -630,165 +645,195 @@
     </div>
 
     <script>
-        // --- THREE.JS Space Animation ---
+        // =====================================================================
+        //  THREE.JS hero scene (optimised)
+        //  - canvas lives INSIDE the hero section (absolute, overflow hidden)
+        //  - IntersectionObserver pauses every update/render when off-screen
+        //  - DPR capped (1.5, or 1.0 on lower-end devices) + adaptive step-down
+        //  - black-hole trails = instanced line strips (far fewer vertices)
+        //  - ~700 background stars with opacity variation (single Points draw)
+        //  - astronaut shaders trimmed, uniforms only written when they change
+        // =====================================================================
         function initSpace() {
             const container = document.getElementById('black-hole-canvas');
+            if (!container || !window.THREE) return;
+
+            // ---------- device tier / quality config ----------
+            const nav = navigator;
+            const isMobile = (window.matchMedia && matchMedia('(pointer: coarse)').matches) ||
+                             /Android|iPhone|iPad|iPod|Mobi/i.test(nav.userAgent);
+            const lowEnd = isMobile || (nav.hardwareConcurrency || 8) <= 4 || (nav.deviceMemory || 8) <= 4;
+            const CFG = {
+                maxDpr: lowEnd ? 1.0 : 1.5,      // GPU fill-rate cap
+                trails: lowEnd ? 4500 : 7000,    // black-hole trails (instances)
+                seg: lowEnd ? 5 : 8,             // segments per trail
+                stars: lowEnd ? 520 : 720,       // background stars (was 5000, and never drawn)
+                starsEnabled: true,              // set false to match the original look exactly
+                glowRadius: 8.0                  // soft-scatter copy only for trails inside this radius
+            };
+
+            // ---------- renderer ----------
+            let renderer;
+            try {
+                renderer = new THREE.WebGLRenderer({
+                    antialias: !lowEnd, alpha: false, stencil: false,
+                    powerPreference: lowEnd ? 'default' : 'high-performance'
+                });
+            } catch (err) { console.warn('WebGL unavailable, hero animation disabled.', err); container.style.display = 'none'; return; }
+            renderer.setClearColor(0x000000, 1);
+            let pixelRatio = Math.min(window.devicePixelRatio || 1, CFG.maxDpr);
+            renderer.setPixelRatio(pixelRatio);
+            const canvas = renderer.domElement;
+            canvas.style.cssText = 'display:block;width:100%;height:100%;';
+            container.appendChild(canvas);
+
             const scene = new THREE.Scene();
-            const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-            const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-            
-            renderer.setSize(window.innerWidth, window.innerHeight);
-            container.appendChild(renderer.domElement);
-
-            // Stars/Particles
-            const starGeometry = new THREE.BufferGeometry();
-            const starMaterial = new THREE.PointsMaterial({ color: 0xFFFFFF, size: 0.7, transparent: true });
-
-            const starVertices = [];
-            for (let i = 0; i < 5000; i++) {
-                const x = (Math.random() - 0.5) * 2000;
-                const y = (Math.random() - 0.5) * 2000;
-                const z = (Math.random() - 0.5) * 2000;
-                starVertices.push(x, y, z);
-            }
-            starGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starVertices, 3));
-            const stars = new THREE.Points(starGeometry, starMaterial);
-
-            // Black Hole (Representation with Mesh)
-            const holeGeo = new THREE.SphereGeometry(15, 64, 64);
-            const holeMat = new THREE.MeshBasicMaterial({ color: 0x000000 });
-            const blackHole = new THREE.Mesh(holeGeo, holeMat);
-            blackHole.position.z = -100;
-
-            // Accretion Disk (Procedural Ring)
-            const torusGeo = new THREE.TorusGeometry(35, 0.2, 16, 100);
-            const torusMat = new THREE.MeshBasicMaterial({ color: 0x666666, transparent: true, opacity: 0.15 });
-            const accretionDisk = new THREE.Mesh(torusGeo, torusMat);
-            accretionDisk.position.z = -100;
-            accretionDisk.rotation.x = Math.PI / 1.8;
-
+            const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 1000);
             camera.position.z = 200;
+            const CAM_DIST = 200;
+            const TAN_HALF_FOV = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
 
-            // --- Astronaut (GLB) ---
-            renderer.outputEncoding = THREE.sRGBEncoding;
-            renderer.toneMapping = THREE.ACESFilmicToneMapping;
-            renderer.toneMappingExposure = 1.15;
-            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            const clamp01 = (x) => Math.min(1, Math.max(0, x));
+            const damp = (k60, dt) => 1 - Math.pow(1 - k60, dt * 60);   // frame-rate independent smoothing
 
-            scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-            const keyLight = new THREE.DirectionalLight(0xffffff, 2.3);
-            keyLight.position.set(60, 80, 120);
-            scene.add(keyLight);
-            const rimLight = new THREE.DirectionalLight(0x8fa8ff, 1.8);
-            rimLight.position.set(-100, 20, -60);
-            scene.add(rimLight);
+            // shared uniforms (black hole, ring and stars all read the same objects)
+            const U = {
+                uTime: { value: 0 }, uFade: { value: 1 }, uAspect: { value: 1 }, uScale: { value: 0.2 },
+                uCenter: { value: new THREE.Vector2() }, uPx: { value: pixelRatio }
+            };
 
-            const astro = new THREE.Group();      // position / scale (driven by intro + scroll)
-            const astroInner = new THREE.Group(); // rotation (float, mouse, scroll spin)
+            // ---------- background stars: 1 draw call, opacity/size variation ----------
+            let stars = null;
+            if (CFG.starsEnabled) {
+                const n = CFG.stars;
+                const pos = new Float32Array(n * 3), att = new Float32Array(n * 3);
+                for (let i = 0; i < n; i++) {
+                    pos[i * 3]     = (Math.random() * 2 - 1) * 1.05;       // NDC x
+                    pos[i * 3 + 1] = (Math.random() * 2 - 1) * 1.05;       // NDC y
+                    pos[i * 3 + 2] = 0.25 + 0.75 * Math.random();          // depth (drift speed / brightness)
+                    att[i * 3]     = 0.10 + 0.90 * Math.pow(Math.random(), 3);   // alpha: many dim, few bright
+                    att[i * 3 + 1] = 1.0 + 1.5 * Math.pow(Math.random(), 6);     // size (css px)
+                    att[i * 3 + 2] = Math.random();                              // twinkle phase
+                }
+                const sg = new THREE.BufferGeometry();
+                sg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+                sg.setAttribute('aA', new THREE.BufferAttribute(att, 3));
+                const sm = new THREE.ShaderMaterial({
+                    uniforms: U,
+                    vertexShader: `
+                        uniform float uTime; uniform float uPx; uniform float uAspect; uniform float uScale; uniform vec2 uCenter;
+                        attribute vec3 aA; varying float vA; varying vec2 vRel;
+                        void main() {
+                            float d = position.z;
+                            vec2 p = position.xy;
+                            p.x = mod(p.x + 1.05 + uTime * 0.004 * d, 2.1) - 1.05;      // slow wrap-around drift
+                            vRel = (p - uCenter) * vec2(uAspect, 1.0) / uScale;          // same units as the black hole
+                            vA = aA.x * (0.85 + 0.15 * sin(uTime * (0.5 + aA.z * 1.5) + aA.z * 6.2831853)) * (0.5 + 0.5 * d);
+                            gl_PointSize = max(1.0, aA.y * uPx);
+                            gl_Position = vec4(p, 0.0, 1.0);
+                        }`,
+                    fragmentShader: `
+                        uniform float uFade; varying float vA; varying vec2 vRel;
+                        void main() {
+                            vec2 q = vRel; if (q.y < 0.0) q.y /= 0.45;
+                            float hide = smoothstep(1.0, 1.35, length(q));               // keep the shadow clean
+                            float a = vA * hide * uFade * smoothstep(0.5, 0.25, length(gl_PointCoord - 0.5));
+                            gl_FragColor = vec4(vec3(0.90, 0.93, 1.0), a);
+                        }`,
+                    blending: THREE.AdditiveBlending, transparent: false, depthTest: false, depthWrite: false
+                });
+                stars = new THREE.Points(sg, sm);
+                stars.frustumCulled = false;
+                stars.renderOrder = -12;
+                scene.add(stars);
+            }
+
+            // ---------- astronaut (GLB) ----------
+            const astro = new THREE.Group();      // position / scale
+            const astroInner = new THREE.Group(); // rotation
             astro.add(astroInner);
             astro.visible = false;
             scene.add(astro);
 
-            // Input state
-            let nx = 0, ny = 0, snx = 0, sny = 0;       // normalised mouse (-1..1) + smoothed
-            window.addEventListener('pointermove', (e) => {
-                nx = (e.clientX / window.innerWidth) * 2 - 1;
-                ny = (e.clientY / window.innerHeight) * 2 - 1;
-            });
-            let smoothY = 0, scrollVel = 0;
-            const sectionEls = Array.from(document.querySelectorAll('section'));
-            let centers = [];
-            function measureSections() {
-                centers = sectionEls.map(el => {
-                    const r = el.getBoundingClientRect();
-                    return window.scrollY + r.top + r.height / 2;
-                });
-            }
-            window.addEventListener('load', measureSections);
-            window.addEventListener('resize', measureSections);
-
-            const introState = { p: 0 };
-            const limb = { uTime: { value: 0 }, uAmp: { value: 1 } };
+            const A = { unit: 0, lastX: undefined, lastY: 0, leanX: 0, leanZ: 0, yaw: 0, pitch: 0, ready: false };
+            const limb = { value: new THREE.Vector3() };   // (leg swing, right-arm angle, left-arm angle) computed on the CPU
             const fade = { value: 0 };
+            const intro = { t: -0.3, p: 0 };               // 0.3s delay, 3.2s power3.out (time only advances while rendering)
 
-            // shared limb-bend GLSL (arms swing, legs kick) used by every pass
+            // limb bend shared by every pass. Trig only runs for vertices that are actually bent (branches are exact: mix(x,y,0)=x)
             const LIMB_GLSL = `
                 vec3 transformed = vec3(position);
                 float h = -position.z;
                 float hs = position.x >= 0.0 ? 1.0 : -1.0;
-                float ss = clamp(position.x / 0.07, -1.0, 1.0);
                 float lw = 1.0 - smoothstep(0.17, 0.32, h);
-                float la = sin(uTime * 3.2) * 0.5 * uAmp * ss * lw;
-                float dyl = transformed.y;
-                float dhl = h - 0.32;
-                float ndy = dyl * cos(la) - dhl * sin(la);
-                float ndh = dyl * sin(la) + dhl * cos(la);
-                transformed.y = mix(transformed.y, ndy, lw);
-                transformed.z = mix(transformed.z, -(0.32 + ndh), lw);
+                if (lw > 0.0) {
+                    float ss = clamp(position.x / 0.07, -1.0, 1.0);
+                    float la = uLimb.x * ss * lw;
+                    float cl = cos(la), sl = sin(la);
+                    float dyl = transformed.y;
+                    float dhl = h - 0.32;
+                    float ndy = dyl * cl - dhl * sl;
+                    float ndh = dyl * sl + dhl * cl;
+                    transformed.y = mix(transformed.y, ndy, lw);
+                    transformed.z = mix(transformed.z, -(0.32 + ndh), lw);
+                }
                 float h2 = -transformed.z;
                 float aw = smoothstep(0.24, 0.36, abs(position.x)) * smoothstep(0.05, 0.18, h2) * (1.0 - smoothstep(0.72, 0.86, h2));
-                float aa = sin(uTime * 2.2 + (hs > 0.0 ? 0.0 : 1.2)) * 0.42 * uAmp * hs;
-                float dx = transformed.x - hs * 0.22;
-                float dh = h2 - 0.52;
-                float nx = dx * cos(aa) - dh * sin(aa);
-                float nh = dx * sin(aa) + dh * cos(aa);
-                transformed.x = mix(transformed.x, hs * 0.22 + nx, aw);
-                transformed.z = mix(transformed.z, -(0.52 + nh), aw);
+                if (aw > 0.0) {
+                    float aa = hs > 0.0 ? uLimb.y : uLimb.z;
+                    float ca = cos(aa), sa = sin(aa);
+                    float dx = transformed.x - hs * 0.22;
+                    float dh = h2 - 0.52;
+                    float nx = dx * ca - dh * sa;
+                    float nh = dx * sa + dh * ca;
+                    transformed.x = mix(transformed.x, hs * 0.22 + nx, aw);
+                    transformed.z = mix(transformed.z, -(0.52 + nh), aw);
+                }
             `;
 
-            // black body: glowing rim + thin panel / crease lines
             function makeBodyMaterial(map) {
                 return new THREE.ShaderMaterial({
-                    uniforms: { uTime: limb.uTime, uAmp: limb.uAmp, uFade: fade, uMap: { value: map } },
+                    uniforms: { uLimb: limb, uFade: fade, uMap: { value: map } },
+                    extensions: { derivatives: true },
                     vertexShader: `
-                        uniform float uTime; uniform float uAmp;
-                        varying vec3 vN; varying vec3 vV; varying vec2 vUv; varying vec3 vP;
+                        uniform vec3 uLimb;
+                        varying vec3 vN; varying vec2 vUv; varying vec3 vP;
                         void main() {
                             ${LIMB_GLSL}
-                            vec4 mv = modelViewMatrix * vec4(transformed, 1.0);
                             vN = normalize(normalMatrix * normal);
-                            vV = -mv.xyz;
                             vUv = uv; vP = position;
-                            gl_Position = projectionMatrix * mv;
+                            gl_Position = projectionMatrix * modelViewMatrix * vec4(transformed, 1.0);
                         }`,
                     fragmentShader: `
                         uniform sampler2D uMap; uniform float uFade;
-                        varying vec3 vN; varying vec3 vV; varying vec2 vUv; varying vec3 vP;
+                        varying vec3 vN; varying vec2 vUv; varying vec3 vP;
                         void main() {
                             if (abs(vP.x) > 0.225 && -vP.z > 0.8 && vP.y < -0.15) discard;   // hides the back-of-helmet knobs
                             vec3 n = normalize(vN);
-                            float ndv = clamp(abs(dot(n, normalize(vV))), 0.0, 1.0);
-                            float rim = smoothstep(0.93, 0.995, 1.0 - ndv);
 
                             // panel lines: colour changes in the original texture
                             float lum = dot(texture2D(uMap, vUv).rgb, vec3(0.299, 0.587, 0.114));
-                            float texEdge = length(vec2(dFdx(lum), dFdy(lum)));
-                            float panel = smoothstep(0.045, 0.14, texEdge);
+                            float panel = smoothstep(0.045, 0.14, length(vec2(dFdx(lum), dFdy(lum))));
 
                             // crease lines: sudden normal changes
                             float crease = smoothstep(0.35, 0.8, length(fwidth(n)));
 
                             float line = clamp(panel * 0.7 + crease * 0.55, 0.0, 1.0);
-                            // Suppress baked-looking circular panel/crease highlights on the
-                            // central helmet dome while retaining the silhouette outline.
                             float helmetDome = smoothstep(0.76, 0.86, -vP.z)
                                              * (1.0 - smoothstep(0.25, 0.34, abs(vP.x)))
                                              * smoothstep(-0.18, -0.02, vP.y);
                             line *= (1.0 - helmetDome);
-                            float glow = line * 0.6;
-                            vec3 col = vec3(0.015) + vec3(0.9, 0.93, 1.0) * glow;
+                            vec3 col = vec3(0.015) + vec3(0.9, 0.93, 1.0) * (line * 0.6);
                             gl_FragColor = vec4(col * uFade, 1.0);
                         }`
                 });
             }
 
-            // additive outline shells: a bright thin edge + soft glow around the silhouette
             function makeShellMaterial(thick, intensity) {
                 return new THREE.ShaderMaterial({
-                    uniforms: { uTime: limb.uTime, uAmp: limb.uAmp, uFade: fade,
-                                uThick: { value: thick }, uI: { value: intensity } },
+                    uniforms: { uLimb: limb, uFade: fade, uThick: { value: thick }, uI: { value: intensity } },
                     vertexShader: `
-                        uniform float uTime; uniform float uAmp; uniform float uThick; varying vec3 vP;
+                        uniform vec3 uLimb; uniform float uThick; varying vec3 vP;
                         void main() {
                             vP = position;
                             ${LIMB_GLSL}
@@ -804,216 +849,340 @@
                 });
             }
 
-            try {
-                const glbBytes = Uint8Array.from(atob(window.ASTRONAUT_GLB_B64), c => c.charCodeAt(0));
-                new THREE.GLTFLoader().parse(glbBytes.buffer, '', (gltf) => {
-                    const model = gltf.scene;
-                    const meshes = [];
-                    model.traverse((o) => { if (o.isMesh) meshes.push(o); });
-                    meshes.forEach((m) => {
-                        const map = m.material.map;
-                        if (map) map.anisotropy = renderer.capabilities.getMaxAnisotropy();
-                        m.material = makeBodyMaterial(map);
-                        m.renderOrder = 20;
-                        // outline shells share the geometry + transform of the body
-                        [[0.011, 1.0]].forEach(([t, k], n) => {
-                            const shell = new THREE.Mesh(m.geometry, makeShellMaterial(t, k));
+            function loadAstronaut() {
+                try {
+                    const b64 = window.ASTRONAUT_GLB_B64;
+                    const bin = atob(b64);
+                    const bytes = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                    window.ASTRONAUT_GLB_B64 = null;              // free ~2.2M chars of string memory
+                    new THREE.GLTFLoader().parse(bytes.buffer, '', (gltf) => {
+                        const model = gltf.scene;
+                        const meshes = [];
+                        model.traverse((o) => { if (o.isMesh) meshes.push(o); });
+                        const aniso = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+                        meshes.forEach((m) => {
+                            const map = m.material.map;
+                            if (map) map.anisotropy = aniso;
+                            m.material = makeBodyMaterial(map);
+                            m.renderOrder = 20;
+                            const shell = new THREE.Mesh(m.geometry, makeShellMaterial(0.011, 1.0));   // shares geometry with the body
                             shell.position.copy(m.position); shell.quaternion.copy(m.quaternion); shell.scale.copy(m.scale);
-                            shell.renderOrder = 10 + n;
+                            shell.renderOrder = 10;
                             m.parent.add(shell);
                         });
-                    });
-                    const box = new THREE.Box3().setFromObject(model);
-                    const size = box.getSize(new THREE.Vector3());
-                    model.position.sub(box.getCenter(new THREE.Vector3()));
-                    astroInner.add(model);
-                    astro.userData.unit = 1 / Math.max(size.x, size.y, size.z); // scale so max dimension = 1 unit
-                    astro.scale.setScalar(0.001);
-                    astro.visible = true;
-                    measureSections();
-                    gsap.to(introState, { p: 1, duration: 3.2, delay: 0.3, ease: 'power3.out' });
-                }, (err) => console.error('Astronaut failed to parse.', err));
-            } catch (e) { console.error('Astronaut failed to load.', e); }
+                        const box = new THREE.Box3().setFromObject(model);
+                        const size = box.getSize(new THREE.Vector3());
+                        model.position.sub(box.getCenter(new THREE.Vector3()));
+                        astroInner.add(model);
+                        A.unit = 1 / Math.max(size.x, size.y, size.z);   // max dimension = 1 unit
+                        astro.scale.setScalar(0.001);
+                        A.ready = true;
+                        intro.t = -0.3;
+                    }, (err) => console.error('Astronaut failed to parse.', err));
+                } catch (e) { console.error('Astronaut failed to load.', e); }
+            }
 
-            // Mouse parallax movement
-            let mouseX = 0, mouseY = 0;
-            window.addEventListener('mousemove', (e) => {
-                mouseX = (e.clientX - window.innerWidth / 2) / 100;
-                mouseY = (e.clientY - window.innerHeight / 2) / 100;
-            });
+            // ---------- black hole: instanced line strips ----------
+            // One instance = one trail. Per-vertex data is just (f, f^1.6); everything else is per-instance,
+            // so the vertex buffer shrinks from ~168k fat vertices to (SEG+1) tiny ones.
+            const BH = { RMAX: 22, K: 0.35, SPEED: 0.7, SPIRAL: 0.53, DIR: -1 };   // DIR: -1 = clockwise
+            const N = CFG.trails, SEG = CFG.seg;
+            const items = new Array(N);
+            for (let i = 0; i < N; i++) {
+                const r = 1.08 + (BH.RMAX - 1.08) * Math.pow(Math.random(), 2.0);   // denser near the hole
+                const len = (0.18 + 0.9 * Math.pow(Math.random(), 2)) * Math.pow(r, -0.35);
+                const om = 0.3 * Math.pow(r, -1.25) * BH.SPEED * BH.DIR * (0.85 + 0.3 * Math.random());
+                const streak = Math.random() < 0.03 ? 1 : 0;
+                const base = (0.2 + 0.7 * Math.pow(Math.random(), 1.5)) * (1 - 0.65 * clamp01((r - 6) / 16)) * (streak ? 2.2 : 1) * 0.8;
+                items[i] = { r, a0: Math.random() * Math.PI * 2, len, om, base, hh: Math.random(), cm: Math.random(), ph: Math.random() * Math.PI * 2 };
+            }
+            items.sort((p, q) => p.r - q.r);            // inner trails first -> glow pass can use a prefix of the instances
+            const dArr = new Float32Array(N * 4), eArr = new Float32Array(N * 4);
+            let glowCount = 0;
+            for (let i = 0; i < N; i++) {
+                const it = items[i];
+                dArr[i * 4] = it.r; dArr[i * 4 + 1] = it.a0; dArr[i * 4 + 2] = it.om; dArr[i * 4 + 3] = it.base;
+                eArr[i * 4] = it.hh; eArr[i * 4 + 1] = it.cm; eArr[i * 4 + 2] = it.ph; eArr[i * 4 + 3] = it.len;
+                if (it.r < CFG.glowRadius) glowCount = i + 1;
+            }
+            items.length = 0;
 
-            const clock = new THREE.Clock();
-            const smooth = (x) => x * x * (3 - 2 * x);
-            const clamp01 = (x) => Math.min(1, Math.max(0, x));
+            const nodes = new Float32Array((SEG + 1) * 3);
+            for (let k = 0; k <= SEG; k++) { const f = k / SEG; nodes[k * 3] = f; nodes[k * 3 + 1] = Math.pow(f, 1.6); }
+            const aD = new THREE.InstancedBufferAttribute(dArr, 4);
+            const aE = new THREE.InstancedBufferAttribute(eArr, 4);
+            const nodeAttr = new THREE.BufferAttribute(nodes, 3);
+            function makeTrailGeo(count) {
+                const g = new THREE.InstancedBufferGeometry();
+                g.setAttribute('position', nodeAttr);
+                g.setAttribute('aD', aD);
+                g.setAttribute('aE', aE);
+                g.instanceCount = count;
+                return g;
+            }
 
-            function updateAstronaut() {
-                if (!astro.userData.unit) return;
-                const t = clock.getElapsedTime();
-                const wide = window.innerWidth >= 1024;
-                const dist = camera.position.z;                              // astronaut lives near z = 0
-                const H = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * dist; // visible world height
-                const W = H * camera.aspect;
+            const f1 = (v) => (v < 0 ? '(' + v.toFixed(4) + ')' : v.toFixed(4));
+            const trailVS = `
+                uniform float uTime; uniform float uScale; uniform float uAspect; uniform vec2 uCenter;
+                attribute vec4 aD;   // r0, angle0, orbital speed, base alpha
+                attribute vec4 aE;   // flicker seed, colour roll, phase, trail length
+                varying float vA; varying vec2 vRel; varying vec3 vCol;
+                void main() {
+                    float f = position.x;                                   // 0 = tail, 1 = head
+                    float r = aD.x * exp(-${f1(BH.SPIRAL)} * f * aE.w);
+                    float a = aD.y + ${f1(BH.DIR)} * f * aE.w + uTime * aD.z;
+                    float alpha = aD.w * position.y;                        // base * f^1.6
+                    float sa = sin(a), ca = cos(a);
+                    vec2 e = vec2(ca * r, sa * r * ${f1(BH.K)});            // tilted disc (ellipse)
+                    float far = step(0.0, sa);
+                    // gravitational lensing: far half bent over the shadow, near half pulled slightly down
+                    float w = smoothstep(7.0, 1.6, r);
+                    e.y += sa * pow(r, -0.8) * w * (far > 0.5 ? 0.3 : 0.05);
+                    // light bending: push apparent positions away from the hole
+                    float d0 = length(e);
+                    e *= 1.0 + 0.2 / (d0 * d0 + 0.3);
+                    vRel = e;
+                    float beam = mix(1.0, 1.8, 0.5 + 0.5 * ca);             // relativistic beaming
+                    float fl = 1.0 + 0.12 * sin(uTime * (0.6 + aE.x * 1.4) + aE.z);
+                    vA = alpha * beam * fl * (far > 0.5 ? 0.7 : 1.0) * mix(0.5, 1.0, smoothstep(1.0, 4.0, r));
+                    vec3 cool = vec3(0.910, 0.898, 0.875), warm = vec3(1.0, 0.945, 0.839);
+                    vec3 gold = vec3(0.910, 0.757, 0.553), amber = vec3(0.722, 0.475, 0.294);
+                    vec3 dark = vec3(0.251, 0.145, 0.118), grey = vec3(0.467);
+                    float inner = 1.0 - smoothstep(1.0, 5.0, r);
+                    vec3 col = mix(cool, warm, inner * 0.8);
+                    col = mix(col, gold, inner * step(0.9, aE.y) * 0.6);
+                    col = mix(col, amber, inner * step(0.98, aE.y) * 0.7);
+                    col = mix(col, grey, smoothstep(8.0, 20.0, r) * 0.6);
+                    col = mix(dark, col, smoothstep(0.0, 0.2, alpha));      // faded tails cool to dark red-brown
+                    vCol = col;
+                    vec2 p = uCenter + vec2(e.x / uAspect, e.y) * uScale;
+                #ifdef GLOW
+                    p += vec2(0.0016, 0.0010); vA *= 0.22;                  // faint offset copy = soft scatter
+                #endif
+                    gl_Position = vec4(p, 0.0, 1.0);
+                }`;
+            const trailFS = `
+                uniform float uFade;
+                varying float vA; varying vec2 vRel; varying vec3 vCol;
+                void main() {
+                    vec2 q = vRel; if (q.y < 0.0) q.y /= 0.45;
+                    float hide = smoothstep(1.0, 1.25, length(q));
+                    float a = vA < 0.6 ? vA : 0.6 + 0.35 * (1.0 - exp(-(vA - 0.6) * 2.5));
+                    gl_FragColor = vec4(min(vCol, vec3(0.95)), a * uFade * hide);
+                }`;
+            const additive = { blending: THREE.AdditiveBlending, transparent: false, depthTest: false, depthWrite: false };
+            const bhMat = new THREE.ShaderMaterial(Object.assign({ uniforms: U, vertexShader: trailVS, fragmentShader: trailFS }, additive));
+            const bhGlowMat = new THREE.ShaderMaterial(Object.assign({ uniforms: U, vertexShader: trailVS, fragmentShader: trailFS, defines: { GLOW: 1 } }, additive));
+            const bhLines = new THREE.Line(makeTrailGeo(N), bhMat);
+            bhLines.frustumCulled = false; bhLines.renderOrder = -10;   // drawn before the astronaut
+            const bhGlow = new THREE.Line(makeTrailGeo(glowCount), bhGlowMat);
+            bhGlow.frustumCulled = false; bhGlow.renderOrder = -11;
+            scene.add(bhGlow, bhLines);
 
-                snx += (nx - snx) * 0.05;
-                sny += (ny - sny) * 0.05;
+            // photon ring: hairline ring just outside the shadow
+            const RING_N = 360;
+            const ringT = new Float32Array(RING_N);
+            for (let i = 0; i < RING_N; i++) ringT[i] = (i / RING_N) * Math.PI * 2;
+            const ringGeo = new THREE.BufferGeometry();
+            ringGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(RING_N * 3), 3));
+            ringGeo.setAttribute('aT', new THREE.BufferAttribute(ringT, 1));
+            const ringMat = new THREE.ShaderMaterial(Object.assign({
+                uniforms: U,
+                vertexShader: `
+                    uniform float uTime; uniform float uScale; uniform float uAspect; uniform vec2 uCenter;
+                    attribute float aT; varying float vA;
+                    void main() {
+                        vec2 e = vec2(cos(aT), sin(aT)) * 1.035;
+                        float n = 0.55 + 0.25 * sin(3.0 * aT + uTime * 0.35) + 0.15 * sin(5.0 * aT - uTime * 0.22 + 1.7)
+                                + 0.10 * sin(9.0 * aT + uTime * 0.5);
+                        float beam = mix(1.0, 1.6, 0.5 + 0.5 * cos(aT));
+                        float lower = smoothstep(-0.1, 0.55, sin(aT));   // lower arc is much fainter
+                        vA = n * beam * 0.2 * lower;
+                        gl_Position = vec4(uCenter + vec2(e.x / uAspect, e.y) * uScale, 0.0, 1.0);
+                    }`,
+                fragmentShader: `
+                    uniform float uFade; varying float vA;
+                    void main() { gl_FragColor = vec4(vec3(1.0), min(vA, 0.92) * uFade); }`
+            }, additive));
+            const bhRing = new THREE.LineLoop(ringGeo, ringMat);
+            bhRing.frustumCulled = false; bhRing.renderOrder = -9;
+            scene.add(bhRing);
 
+            // ---------- sizing: follows the hero container, not the window ----------
+            let cw = 0, ch = 0, wide = true, worldH = 1, worldW = 1;
+            function layout() {
+                const w = container.clientWidth || window.innerWidth;
+                const h = container.clientHeight || window.innerHeight;
+                if (w === cw && h === ch) return;
+                cw = w; ch = h;
+                renderer.setSize(w, h, false);
+                camera.aspect = w / h;
+                camera.updateProjectionMatrix();
+                wide = w >= 1024;
+                U.uAspect.value = w / h;
+                U.uScale.value = wide ? 0.32 : 0.19;
+                U.uCenter.value.set(wide ? 0.464 : 0.4, wide ? 0.258 : -0.6);
+                U.uPx.value = pixelRatio;
+                worldH = 2 * TAN_HALF_FOV * CAM_DIST;     // visible world height at the astronaut's depth
+                worldW = worldH * camera.aspect;
+            }
+            layout();
+            if ('ResizeObserver' in window) new ResizeObserver(layout).observe(container);
+            else window.addEventListener('resize', layout);
+
+            // ---------- input ----------
+            let cx = window.innerWidth / 2, cy = window.innerHeight / 2;
+            window.addEventListener('pointermove', (e) => { cx = e.clientX; cy = e.clientY; }, { passive: true });
+            let snx = 0, sny = 0, smoothY = window.scrollY, bhY = smoothY, scrollVel = 0;
+            let time = 0, lastTs = 0, rafId = 0, running = false;
+            let bhVisible = true, bhFadeVal = 1;
+
+            const clampL = (v) => Math.max(-0.4, Math.min(0.4, v));
+
+            function updateAstronaut(dt, t) {
+                const vh = ch;
                 const prevY = smoothY;
-                smoothY += (window.scrollY - smoothY) * 0.08;
-                scrollVel += (((smoothY - prevY) / window.innerHeight) - scrollVel) * 0.1;
+                smoothY += (window.scrollY - smoothY) * damp(0.08, dt);
+                scrollVel += (((smoothY - prevY) / vh) / (60 * dt) - scrollVel) * damp(0.1, dt);
 
-                // --- hero only: the astronaut lives in the first screen and scrolls away with it ---
-                const heroFade = 1 - clamp01((smoothY - window.innerHeight * 0.3) / (window.innerHeight * 0.6));
-                astro.visible = heroFade > 0.01;
+                const heroFade = 1 - clamp01((smoothY - vh * 0.3) / (vh * 0.6));
+                astro.visible = A.ready && heroFade > 0.01;
                 if (!astro.visible) return;
+
+                const H = worldH, W = worldW;
+                const nx = (cx / window.innerWidth) * 2 - 1, ny = (cy / window.innerHeight) * 2 - 1;
+                snx += (nx - snx) * damp(0.05, dt);
+                sny += (ny - sny) * damp(0.05, dt);
+
+                // canvas scrolls with the hero natively, so no scroll offset is needed here
                 let px = wide ? W * 0.33 : W * 0.22;
-                let py = (wide ? -H * 0.05 : H * 0.355) + (smoothY / window.innerHeight) * H;   // rides up with the page
+                let py = wide ? -H * 0.05 : H * 0.355;
                 const size = H * (wide ? 0.31 : 0.17);
                 const op = (wide ? 1 : 0.95) * heroFade;
-                const baseYaw = -0.55;
-                const glide = 0;
 
-                // --- roaming: a lazy flight path around its dock point ---
+                // roaming: lazy flight path around the dock point
                 px += Math.sin(t * 0.55) * W * 0.022 + Math.sin(t * 0.23 + 1.3) * W * 0.012;
-                py += Math.sin(t * 0.8) * H * 0.03 + Math.cos(t * 0.37) * H * 0.03 + glide * Math.sin(t * 3) * H * 0.006;
-                // mouse parallax
+                py += Math.sin(t * 0.8) * H * 0.03 + Math.cos(t * 0.37) * H * 0.03;
                 px += snx * H * 0.03;
                 py -= sny * H * 0.02;
 
-                // how fast it is travelling (world units / second) -> lean into the motion, frame-rate independent
-                const dt = Math.min(Math.max(t - (astro.userData.lastT || t), 0.001), 0.1);
-                astro.userData.lastT = t;
-                if (astro.userData.lastX === undefined) { astro.userData.lastX = px; astro.userData.lastY = py; }
-                const vx = (px - astro.userData.lastX) / dt, vy = (py - astro.userData.lastY) / dt;
-                astro.userData.lastX = px; astro.userData.lastY = py;
+                if (A.lastX === undefined) { A.lastX = px; A.lastY = py; }
+                const vx = (px - A.lastX) / dt, vy = (py - A.lastY) / dt;
+                A.lastX = px; A.lastY = py;
                 const kLean = 1 - Math.exp(-dt * 4);
-                const clampL = (v) => Math.max(-0.4, Math.min(0.4, v));
-                astro.userData.leanZ = (astro.userData.leanZ || 0) + (clampL(-vx * 0.012 * (H / 307)) - (astro.userData.leanZ || 0)) * kLean;
-                astro.userData.leanX = (astro.userData.leanX || 0) + (clampL(vy * 0.012 * (H / 307)) - (astro.userData.leanX || 0)) * kLean;
+                A.leanZ += (clampL(-vx * 0.012 * (H / 307)) - A.leanZ) * kLean;
+                A.leanX += (clampL(vy * 0.012 * (H / 307)) - A.leanX) * kLean;
                 const speed = Math.min(Math.hypot(vx, vy) / 40, 1.5);
-                limb.uTime.value = t;
-                limb.uAmp.value = 0.75 + speed * 0.5 + glide * 0.6;
+                const amp = 0.75 + speed * 0.5;
+                limb.value.set(Math.sin(t * 3.2) * 0.5 * amp,
+                               Math.sin(t * 2.2) * 0.42 * amp,
+                              -Math.sin(t * 2.2 + 1.2) * 0.42 * amp);
 
-                // --- intro fly-in from deep space ---
-                const p = introState.p;
-                const e = p;
+                // intro fly-in from deep space (power3.out)
+                if (intro.p < 1) { intro.t += dt; const x = clamp01(intro.t / 3.2); intro.p = 1 - Math.pow(1 - x, 3); }
+                const p = intro.p;
                 const sx = -W * 0.8, sy = H * 0.5, sz = -330;
-                astro.position.set(sx + (px - sx) * e, sy + (py - sy) * e, sz * (1 - e));
+                astro.position.set(sx + (px - sx) * p, sy + (py - sy) * p, sz * (1 - p));
                 const spinIn = (1 - p) * Math.PI * 4;
 
-                // --- always face the cursor: aim at a point on the cursor's ray, in front of the astronaut ---
-                const zT = 100, kz = (dist - zT) / dist;
+                // face the cursor
+                const zT = 100, kz = (CAM_DIST - zT) / CAM_DIST;
                 const ax = nx * (W / 2) * kz - astro.position.x;
                 const ay = -ny * (H / 2) * kz - astro.position.y;
                 const az = zT - astro.position.z;
                 const yawT = Math.max(-1.4, Math.min(1.4, Math.atan2(ax, az)));
                 const pitchT = Math.max(-1.0, Math.min(1.0, -Math.atan2(ay, Math.hypot(ax, az))));
                 const kLook = 1 - Math.exp(-dt * 7);
-                astro.userData.yaw = (astro.userData.yaw || 0) + (yawT - (astro.userData.yaw || 0)) * kLook;
-                astro.userData.pitch = (astro.userData.pitch || 0) + (pitchT - (astro.userData.pitch || 0)) * kLook;
+                A.yaw += (yawT - A.yaw) * kLook;
+                A.pitch += (pitchT - A.pitch) * kLook;
                 astroInner.rotation.order = 'YXZ';
                 astroInner.rotation.set(
-                    astro.userData.pitch + Math.sin(t * 0.5) * 0.04 + astro.userData.leanX + (1 - p) * 1.2,
-                    astro.userData.yaw + spinIn,
-                    Math.cos(t * 0.6) * 0.05 + astro.userData.leanZ - scrollVel * 4 + (1 - p) * Math.PI
+                    A.pitch + Math.sin(t * 0.5) * 0.04 + A.leanX + (1 - p) * 1.2,
+                    A.yaw + spinIn,
+                    Math.cos(t * 0.6) * 0.05 + A.leanZ - scrollVel * 4 + (1 - p) * Math.PI
                 );
-                astro.scale.setScalar(Math.max(size * astro.userData.unit * (0.25 + 0.75 * p), 0.001));
-                fade.value = Math.min(1, op * Math.min(1, p * 2.5));
-
+                astro.scale.setScalar(Math.max(size * A.unit * (0.25 + 0.75 * p), 0.001));
+                const f = Math.min(1, op * Math.min(1, p * 2.5));
+                if (Math.abs(f - fade.value) > 1e-4) fade.value = f;     // only touch the uniform when it changes
             }
 
-            // --- Hero black hole: swirling star trails around a black sphere (hero only) ---
-            const BH = { N: 3600, SEG: 8, RMAX: 22, K: 0.38, ROLL: 0.18 };
-            const bhData = new Float32Array(BH.N * BH.SEG * 2 * 4);
-            let bi = 0;
-            for (let i = 0; i < BH.N; i++) {
-                const r = 1.08 + (BH.RMAX - 1.08) * Math.pow(Math.random(), 2.0);   // denser near the hole
-                const a0 = Math.random() * Math.PI * 2;
-                const len = (0.12 + 0.5 * Math.pow(Math.random(), 2)) * Math.pow(r, -0.6);
-                const om = 0.3 * Math.pow(r, -1.25);                                // inner trails orbit faster
-                const base = (0.2 + 0.7 * Math.pow(Math.random(), 1.5)) * (1 - 0.65 * clamp01((r - 6) / 16));
-                for (let s = 0; s < BH.SEG; s++) {
-                    for (let e = 0; e < 2; e++) {
-                        const f = (s + e) / BH.SEG;                                  // 0 = tail, 1 = head
-                        bhData[bi++] = r; bhData[bi++] = a0 + f * len; bhData[bi++] = om; bhData[bi++] = base * Math.pow(f, 1.6);
-                    }
-                }
-            }
-            const bhGeo = new THREE.BufferGeometry();
-            bhGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(BH.N * BH.SEG * 2 * 3), 3));
-            bhGeo.setAttribute('aD', new THREE.BufferAttribute(bhData, 4));
-            const bhMat = new THREE.ShaderMaterial({
-                uniforms: {
-                    uTime: { value: 0 }, uFade: { value: 1 }, uAspect: { value: 1 }, uScale: { value: 0.2 },
-                    uCenter: { value: new THREE.Vector2() }, uK: { value: BH.K }, uRoll: { value: BH.ROLL }
-                },
-                vertexShader: `
-                    attribute vec4 aD;
-                    uniform float uTime; uniform float uK; uniform float uRoll; uniform float uScale; uniform float uAspect;
-                    uniform vec2 uCenter;
-                    varying float vA; varying float vFar; varying vec2 vRel;
-                    void main() {
-                        float a = aD.y + uTime * aD.z;
-                        vec2 e = vec2(cos(a), sin(a)) * aD.x;
-                        e.y *= uK;                                   // tilt the disc into an ellipse
-                        float c = cos(uRoll), s = sin(uRoll);
-                        e = vec2(c * e.x - s * e.y, s * e.x + c * e.y);
-                        vRel = e; vFar = sin(a); vA = aD.w;
-                        gl_Position = vec4(uCenter + vec2(e.x / uAspect, e.y) * uScale, 0.0, 1.0);
-                    }`,
-                fragmentShader: `
-                    uniform float uFade;
-                    varying float vA; varying float vFar; varying vec2 vRel;
-                    void main() {
-                        // trails on the far side of the disc pass behind the black sphere
-                        float hide = vFar > 0.0 ? smoothstep(0.96, 1.02, length(vRel)) : 1.0;
-                        gl_FragColor = vec4(vec3(0.95), vA * uFade * hide);
-                    }`,
-                blending: THREE.AdditiveBlending, transparent: false, depthTest: false, depthWrite: false
-            });
-            const bhLines = new THREE.LineSegments(bhGeo, bhMat);
-            bhLines.frustumCulled = false;
-            bhLines.renderOrder = -10;   // drawn first, so the astronaut stays on top
-            scene.add(bhLines);
-
-            let bhY = 0;
-            function updateBlackHole() {
-                bhY += (window.scrollY - bhY) * 0.1;
-                const vh = window.innerHeight;
+            function updateBlackHole(dt, t) {
+                bhY += (window.scrollY - bhY) * damp(0.1, dt);
+                const vh = ch;
                 const fadeBH = 1 - clamp01((bhY - vh * 0.25) / (vh * 0.7));
-                bhLines.visible = fadeBH > 0.01;
-                if (!bhLines.visible) return;
-                const wide = window.innerWidth >= 1024;
-                const u = bhMat.uniforms;
-                u.uTime.value = clock.getElapsedTime();
-                u.uAspect.value = window.innerWidth / vh;
-                u.uScale.value = wide ? 0.21 : 0.13;
-                u.uCenter.value.set(wide ? 0.44 : 0.4, (wide ? 0.3 : -0.6) + (bhY / vh) * 2);   // scrolls away with the hero
-                u.uFade.value = fadeBH;
+                bhVisible = fadeBH > 0.01;
+                bhLines.visible = bhGlow.visible = bhRing.visible = bhVisible;
+                if (stars) stars.visible = bhVisible;
+                if (!bhVisible) return;
+                U.uTime.value = t;
+                if (Math.abs(fadeBH - bhFadeVal) > 1e-4) { bhFadeVal = fadeBH; U.uFade.value = fadeBH; }
             }
 
-            function animate() {
-                requestAnimationFrame(animate);
-                updateAstronaut();
-                updateBlackHole();
-                
-                stars.rotation.y += 0.0002;
-                stars.rotation.x += 0.0001;
-                accretionDisk.rotation.z += 0.005;
-                
-                camera.position.x += (mouseX - camera.position.x) * 0.05;
-                camera.position.y += (-mouseY - camera.position.y) * 0.05;
+            // ---------- adaptive resolution: step the DPR down if frames stay slow ----------
+            let ema = 16.7, slowFor = 0, warm = 0;
+            function governor(ms) {
+                if (ms > 100) return;                       // hitch (tab switch, shader compile): ignore
+                ema += (ms - ema) * 0.05;
+                warm += ms;
+                if (warm < 3000 || pixelRatio <= 1) return;
+                if (ema > 21) {
+                    slowFor += ms;
+                    if (slowFor > 1500) {
+                        pixelRatio = Math.max(1, pixelRatio - 0.25);
+                        renderer.setPixelRatio(pixelRatio);
+                        cw = 0; layout();                     // re-apply buffer size at the new ratio
+                        slowFor = 0; warm = 2000; ema = 16.7;
+                    }
+                } else slowFor = 0;
+            }
+
+            // ---------- render loop (only alive while the hero is on screen) ----------
+            function frame(ts) {
+                rafId = requestAnimationFrame(frame);
+                const dtRaw = (ts - lastTs) / 1000;
+                lastTs = ts;
+                const dt = Math.min(Math.max(dtRaw, 0.001), 0.1);
+                governor(dtRaw * 1000);
+                time += dt;
+
+                updateAstronaut(dt, time);
+                updateBlackHole(dt, time);
+                if (!astro.visible && !bhVisible) return;   // hero scrolled away: nothing to draw
+
+                const k = damp(0.05, dt);
+                camera.position.x += ((cx - window.innerWidth / 2) / 100 - camera.position.x) * k;
+                camera.position.y += (-(cy - window.innerHeight / 2) / 100 - camera.position.y) * k;
                 camera.lookAt(scene.position);
 
                 renderer.render(scene, camera);
             }
 
-            animate();
-
-            window.addEventListener('resize', () => {
-                camera.aspect = window.innerWidth / window.innerHeight;
-                camera.updateProjectionMatrix();
-                renderer.setSize(window.innerWidth, window.innerHeight);
+            let inView = false, tabVisible = !document.hidden;
+            function setRunning(on) {
+                if (on === running) return;
+                running = on;
+                if (on) {
+                    lastTs = performance.now();               // no dt spike after a pause
+                    smoothY = bhY = window.scrollY; scrollVel = 0;
+                    rafId = requestAnimationFrame(frame);
+                } else {
+                    cancelAnimationFrame(rafId);
+                }
+            }
+            if ('IntersectionObserver' in window) {
+                new IntersectionObserver((entries) => {
+                    inView = entries[entries.length - 1].isIntersecting;
+                    setRunning(inView && tabVisible);
+                }, { threshold: 0 }).observe(container);
+            } else { inView = true; setRunning(tabVisible); }
+            document.addEventListener('visibilitychange', () => {
+                tabVisible = !document.hidden;
+                setRunning(inView && tabVisible);
             });
+
+            // parse the model after first paint so it doesn't block initial load
+            setTimeout(loadAstronaut, 0);
         }
 
         // --- GSAP Animations ---
@@ -1045,24 +1214,30 @@
                 });
             });
 
-            // Navbar background shift on scroll
-            window.addEventListener('scroll', () => {
-                const header = document.getElementById('main-header');
-                if (window.scrollY > 50) {
+            // Navbar background shift on scroll (only touches the DOM when the state flips)
+            const header = document.getElementById('main-header');
+            let scrolled = null;
+            function onScroll() {
+                const s = window.scrollY > 50;
+                if (s === scrolled) return;
+                scrolled = s;
+                if (s) {
                     header.classList.add('bg-black/80', 'backdrop-blur-md', 'py-4');
                     header.classList.remove('py-8');
                 } else {
                     header.classList.remove('bg-black/80', 'backdrop-blur-md', 'py-4');
                     header.classList.add('py-8');
                 }
-            });
+            }
+            window.addEventListener('scroll', onScroll, { passive: true });
+            onScroll();
         }
 
         // Initialize everything
         document.addEventListener('DOMContentLoaded', () => {
             initSpace();
             initGSAP();
-            
+
             // Handle mobile menu
             const mobileBtn = document.getElementById('mobile-menu-btn');
             mobileBtn.addEventListener('click', () => {
